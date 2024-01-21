@@ -1,0 +1,8 @@
+**/COLCON_IGNORE
+*.pyc
+**/__pycache__/
+*.swp
+**/venv/
+
+.clang-format
+.pre-commit-config.yaml

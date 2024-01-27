@@ -8,6 +8,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from tf_transformations import euler_from_quaternion
 
+PUBLISH_ERROR = True
+
 
 class YawController(Node):
 
@@ -17,24 +19,45 @@ class YawController(Node):
                          history=QoSHistoryPolicy.KEEP_LAST,
                          depth=1)
 
+        self.Kp = 0.5
+        self.Kd = 0.2
+        self.Ki = 0.1
+
+        self.i_error = 0.0
+        self.i_shutoff = 0.5
+        
+        self.last_error = 0.0
+        self.last_time = self.get_clock().now()
+
         # default value for the yaw setpoint
         self.setpoint = math.pi / 2.0
         self.setpoint_timed_out = True
+
+        self.timeout_timer = self.create_timer(0.5, self.on_setpoint_timeout)
 
         self.vision_pose_sub = self.create_subscription(
             msg_type=PoseWithCovarianceStamped,
             topic='vision_pose_cov',
             callback=self.on_vision_pose,
             qos_profile=qos)
-        self.setpoint_sub = self.create_subscription(Float64Stamped,
-                                                     topic='~/setpoint',
-                                                     callback=self.on_setpoint,
-                                                     qos_profile=qos)
-        self.timeout_timer = self.create_timer(0.5, self.on_setpoint_timeout)
+        self.setpoint_sub = self.create_subscription(
+            Float64Stamped,
+            topic='~/setpoint',
+            callback=self.on_setpoint,
+            qos_profile=qos
+        )
 
-        self.torque_pub = self.create_publisher(msg_type=ActuatorSetpoint,
-                                                topic='torque_setpoint',
-                                                qos_profile=1)
+        self.torque_pub = self.create_publisher(
+            msg_type=ActuatorSetpoint,
+            topic='torque_setpoint',
+            qos_profile=1
+        )
+        if PUBLISH_ERROR:
+            self.error_pub = self.create_publisher(
+                msg_type=Float64Stamped,
+                topic='~/error',
+                qos_profile=1
+            )
 
     def on_setpoint_timeout(self):
         self.timeout_timer.cancel()
@@ -73,11 +96,33 @@ class YawController(Node):
         # very important: normalize the angle error!
         error = self.wrap_pi(self.setpoint - yaw)
 
-        p_gain = 0.1  # turned out to be a good value
-        return p_gain * error
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds * 1e-9
+        try:
+            d_error = (error - self.last_error) / dt
+        except ZeroDivisionError:
+            self.get_logger().warning("dt is zero!")
+            d_error = 0.0
 
-    def publish_control_output(self, control_output: float,
-                               timestamp: rclpy.time.Time):
+        self.last_error = error
+        self.last_time = now
+
+        if dt < 0.1 and error < self.i_shutoff:
+            self.i_error += ((self.last_error + error) / 2) * dt
+        else:
+            self.i_error = 0
+
+        yaw_thrust = self.Kp * error + self.Kd * d_error + self.Ki * self.i_error
+
+        if PUBLISH_ERROR:
+            msg = Float64Stamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.data = yaw_thrust
+            self.error_pub.publish(msg)
+
+        return yaw_thrust
+
+    def publish_control_output(self, control_output: float, timestamp: rclpy.time.Time):
         msg = ActuatorSetpoint()
         msg.header.stamp = timestamp.to_msg()
         msg.ignore_x = True

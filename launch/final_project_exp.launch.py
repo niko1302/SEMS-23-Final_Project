@@ -19,7 +19,6 @@ def generate_launch_description() -> LaunchDescription:
 
     package_path = get_package_share_path('final_project')
     mapping_params_file_path = str(package_path / 'config/mapping_params.yaml')
-    position_control_params_file_path = str(package_path / 'config/position_control_params.yaml')
 
     scenario_arg = DeclareLaunchArgument(
         name='scenario',
@@ -33,41 +32,43 @@ def generate_launch_description() -> LaunchDescription:
             executable='mapper.py',
             package='final_project',
             parameters=[
-                LaunchConfiguration(
-                    'mapping_params',
-                    default=mapping_params_file_path),
-                {'use_sim_time': LaunchConfiguration('use_sim_time'),},
+                LaunchConfiguration('mapping_params',
+                                    default=mapping_params_file_path),
+                {
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
             ],
         ),
         Node(
             executable='path_planner.py',
             package='final_project',
             parameters=[
-                {'use_sim_time': LaunchConfiguration('use_sim_time'),},
+                {
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
             ],
         ),
         Node(
             executable='path_follower.py',
             package='final_project',
             parameters=[
-                {'use_sim_time': LaunchConfiguration('use_sim_time'),},
+                {
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
             ],
         ),
-        Node(
-            executable='position_controller.py',
-            package='final_project',
-            parameters=[
-                LaunchConfiguration(
-                    'position_control_params',
-                    default=position_control_params_file_path),
-                {'use_sim_time': LaunchConfiguration('use_sim_time'),}
-            ],
-        ),
+        Node(executable='position_controller.py',
+             package='final_project',
+             parameters=[{
+                 'use_sim_time': LaunchConfiguration('use_sim_time'),
+             }]),
         Node(
             executable='yaw_controller.py',
             package='final_project',
             parameters=[
-                {'use_sim_time': LaunchConfiguration('use_sim_time'),},
+                {
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
             ],
         ),
         Node(
@@ -84,13 +85,15 @@ def generate_launch_description() -> LaunchDescription:
             executable='robot_marker_publisher',
             package='fav',
             parameters=[
-                {'use_sim_time': LaunchConfiguration('use_sim_time'),},
+                {
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
             ],
         ),
     ])
     launch_description.add_action(group)
     rviz_file = str(
-        get_package_share_path('final_project') / 'config/rviz.rviz')
+        get_package_share_path('final_project') / 'config/experiment.rviz')
 
     action = Node(
         executable='rviz2',

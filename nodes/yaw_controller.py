@@ -5,6 +5,7 @@ import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from hippo_msgs.msg import ActuatorSetpoint, Float64Stamped
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from tf_transformations import euler_from_quaternion
 
@@ -15,17 +16,21 @@ class YawController(Node):
 
     def __init__(self):
         super().__init__(node_name='yaw_controller')
-        qos = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                         history=QoSHistoryPolicy.KEEP_LAST,
-                         depth=1)
+        qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
 
-        self.Kp = 0.5
-        self.Kd = 0.2
-        self.Ki = 0.1
+        # -- Parameter --
+        self.Kp: float
+        self.Kd: float
+        self.Ki: float
+        self.i_shutoff: float
+        self.beta: float
 
+        # -- internal class variables --
         self.i_error = 0.0
-        self.i_shutoff = 0.5
-        
         self.last_error = 0.0
         self.last_time = self.get_clock().now()
 
@@ -33,8 +38,13 @@ class YawController(Node):
         self.setpoint = math.pi / 2.0
         self.setpoint_timed_out = True
 
+        # -- Parameters --
+        self.init_params()
+        self.add_on_set_parameters_callback(self.on_params_changed)
+
         self.timeout_timer = self.create_timer(0.5, self.on_setpoint_timeout)
 
+        # -- Subscribers --
         self.vision_pose_sub = self.create_subscription(
             msg_type=PoseWithCovarianceStamped,
             topic='vision_pose_cov',
@@ -47,6 +57,7 @@ class YawController(Node):
             qos_profile=qos
         )
 
+        # -- Publishers --
         self.torque_pub = self.create_publisher(
             msg_type=ActuatorSetpoint,
             topic='torque_setpoint',
@@ -58,6 +69,63 @@ class YawController(Node):
                 topic='~/error',
                 qos_profile=1
             )
+            self.filtered_error_pub = self.create_publisher(
+                msg_type=Float64Stamped,
+                topic='~/filtered_error',
+                qos_profile=1
+            )
+
+    def init_params(self) -> None:
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('p_gain', rclpy.Parameter.Type.DOUBLE),
+                ('d_gain', rclpy.Parameter.Type.DOUBLE),
+                ('i_gain', rclpy.Parameter.Type.DOUBLE),
+                ('i_shutoff', rclpy.Parameter.Type.DOUBLE),
+                ('beta', rclpy.Parameter.Type.DOUBLE),
+            ]
+        )
+
+        param = self.get_parameter('p_gain')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.Kp = param.value
+
+        param = self.get_parameter('d_gain')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.Kd = param.value
+
+        param = self.get_parameter('i_gain')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.Ki = param.value
+
+        param = self.get_parameter('i_shutoff')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.i_shutoff = param.value
+
+        param = self.get_parameter('beta')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.beta = param.value
+
+
+    def on_params_changed(self, params) -> SetParametersResult:
+        param: rclpy.Parameter
+        for param in params:
+            self.get_logger().info(f'Try to set [{param.name}] = {param.value}')
+            if param.name == 'p_gain':
+                self.Kp = param.value
+            elif param.name == 'd_gain':
+                self.Kd = param.value
+            elif param.name == 'i_gain':
+                self.Ki = param.value
+            elif param.name == 'i_shutoff':
+                self.i_shutoff = param.value
+            elif param.name == 'beta':
+                self.beta = param.value
+            else:
+                self.get_logger().warning('Did not find parameter!')
+        return SetParametersResult(successful= True, reason='Parameter set!')
+
 
     def on_setpoint_timeout(self):
         self.timeout_timer.cancel()
@@ -96,6 +164,20 @@ class YawController(Node):
         # very important: normalize the angle error!
         error = self.wrap_pi(self.setpoint - yaw)
 
+        if PUBLISH_ERROR:
+            msg = Float64Stamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.data = error
+            self.error_pub.publish(msg)
+
+        error = (self.beta*error) + ((1-self.beta) * self.last_error)
+
+        if PUBLISH_ERROR:
+            msg = Float64Stamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.data = error
+            self.filtered_error_pub.publish(msg)
+
         now = self.get_clock().now()
         dt = (now - self.last_time).nanoseconds * 1e-9
         try:
@@ -113,12 +195,6 @@ class YawController(Node):
             self.i_error = 0
 
         yaw_thrust = self.Kp * error + self.Kd * d_error + self.Ki * self.i_error
-
-        if PUBLISH_ERROR:
-            msg = Float64Stamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.data = yaw_thrust
-            self.error_pub.publish(msg)
 
         return yaw_thrust
 

@@ -7,13 +7,12 @@ from geometry_msgs.msg import Point, PointStamped, PoseWithCovarianceStamped
 from hippo_msgs.msg import ActuatorSetpoint
 from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
+from std_srvs.srv import SetBool
 from tf_transformations import euler_from_quaternion
 
 PUBLISH_ERROR = True
-
-if PUBLISH_ERROR:
-    from geometry_msgs.msg import Point
-
+SCALE_KP_BY = 0.6
+SCALE_KD_BY = 0.6
 
 class PositionController(Node):
 
@@ -22,11 +21,15 @@ class PositionController(Node):
 
         self.Kp = {'x': 0.0, 'y': 0.0, 'z': 0.0}
         self.Kd = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+        self.beta = 0.2
 
         self.last_time = self.get_clock().now()
         self.last_x_error = 0.0
         self.last_y_error = 0.0
         self.last_z_error = 0.0
+
+        self.Kp_scale = 1.0
+        self.Kd_scale = 1.0
 
         self.setpoint = Point()
         self.setpoint_timed_out = True
@@ -48,6 +51,11 @@ class PositionController(Node):
                 topic='~/error',
                 qos_profile=1
             )
+            self.filtered_error_pub = self.create_publisher(
+                msg_type=Point,
+                topic='~/filtered_error',
+                qos_profile=1
+            )
         
         # -- Subscribers --
         self.position_setpoint_sub = self.create_subscription(
@@ -61,6 +69,13 @@ class PositionController(Node):
             'vision_pose_cov',
             self.on_pose,
             1
+        )
+
+        # -- Services --
+        self.reduce_K_srv = self.create_service(
+            SetBool,
+            '~/scale_K',
+            self.srv_accel,
         )
         
         # -- Timers --
@@ -103,6 +118,18 @@ class PositionController(Node):
         param = self.get_parameter('d_gain.z')
         self.get_logger().info(f'{param.name}={param.value}')
         self.Kd['z'] = param.value
+
+
+    def srv_accel(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+        if request.data:
+            self.Kp_scale = SCALE_KP_BY
+            self.Kd_scale = SCALE_KD_BY
+        else:
+            self.Kp_scale = 1.0
+            self.Kd_scale = 1.0
+
+        response.success = True
+        return response
 
 
     def on_params_changed(self, params) -> SetParametersResult:
@@ -155,6 +182,17 @@ class PositionController(Node):
         y_error = self.setpoint.y - position.y
         z_error = self.setpoint.z - position.z
 
+        if PUBLISH_ERROR:
+            error_msg = Point()
+            error_msg.x = x_error
+            error_msg.y = y_error
+            error_msg.z = z_error
+            self.error_pub.publish(error_msg)
+
+        x_error = (x_error*self.beta) + ((1.0-self.beta) * self.last_x_error)
+        y_error = (y_error*self.beta) + ((1.0-self.beta) * self.last_y_error)
+        z_error = (z_error*self.beta) + ((1.0-self.beta) * self.last_z_error)
+
         dt = (now - self.last_time).nanoseconds * 1e-9
         try:
             dx_error = (x_error - self.last_x_error) / dt
@@ -166,9 +204,9 @@ class PositionController(Node):
             dy_error = 0.0
             dz_error = 0.0
 
-        x = self.Kp['x'] * x_error + self.Kd['x'] * dx_error
-        y = self.Kp['y'] * y_error + self.Kd['y'] * dy_error
-        z = self.Kp['z'] * z_error + self.Kd['z'] * dz_error
+        x = (self.Kp['x'] * self.Kp_scale) * x_error + (self.Kd['x'] * self.Kd_scale) * dx_error
+        y = (self.Kp['y'] * self.Kp_scale) * y_error + (self.Kd['y'] * self.Kd_scale) * dy_error
+        z = (self.Kp['z'] * self.Kp_scale) * z_error + (self.Kd['z'] * self.Kd_scale) * dz_error
 
         msg = ActuatorSetpoint()
         msg.header.stamp = now.to_msg()
@@ -182,13 +220,14 @@ class PositionController(Node):
         self.last_y_error = y_error
         self.last_z_error = z_error
         self.last_time = now
-
+        
         if PUBLISH_ERROR:
-            error_msg = Point()
-            error_msg.x = x_error
-            error_msg.y = y_error
-            error_msg.z = z_error
-            self.error_pub.publish(error_msg)
+            filtered_msg = Point()
+            filtered_msg.x = x_error
+            filtered_msg.y = y_error
+            filtered_msg.z = z_error
+            self.filtered_error_pub.publish(filtered_msg)
+
 
         self.thrust_pub.publish(msg)
 

@@ -1,0 +1,7 @@
+/**: # wildcard for the node name
+  ros__parameters:
+    p_gain: 0.25 # 0.5
+    d_gain: 0.15 # 0.2
+    i_gain: 0.1 # 0.1
+    i_shutoff: 0.4
+    beta: 0.2

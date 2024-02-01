@@ -11,7 +11,7 @@ from rclpy.node import Node
 from scenario_msgs.msg import Viewpoints, Viewpoint
 from scenario_msgs.srv import MoveToStart, SetPath
 from std_msgs.msg import Header
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from visualization_msgs.msg import Marker
 
@@ -27,11 +27,11 @@ class State(Enum):
 
 
 class AStarCell:
-    def __init__(self, pos: list[int], start: list[int], finish: list[int], visited: bool, parent = None) -> None:
+    def __init__(self, pos: Point, start: Point, finish: Point, visited: bool, parent = None) -> None:
         # -- Position Data --
         self.pos = pos
-        self.x = pos[0]
-        self.y = pos[1]
+        self.x = int(pos.x)
+        self.y = int(pos.y)
 
         # -- Parent Data --
         self.parent = parent
@@ -48,9 +48,9 @@ class AStarCell:
         self.visited = visited
 
 
-    def __calculate_distance(self, p0: list[int], p1: list[int]) -> float:
-        dx = abs(p1[0] - p0[0])
-        dy = abs(p1[1] - p0[1])
+    def __calculate_distance(self, p0: Point, p1: Point) -> float:
+        dx = abs(p1.x - p0.x)
+        dy = abs(p1.y - p0.y)
         return (np.sqrt(2)*dy + (dx-dy)) if dy <= dx else (np.sqrt(2)*dx + (dy-dx))
 
 
@@ -64,19 +64,24 @@ class PathPlanner(Node):
         
         # -- node settings --
         self.cell_size = 0.2
-        self.orientation_method = 'const_change' # 'goal', 'start'
+        self.orientation_method = 'const_change' # 'first_3rd', 'const_change', 'goal', 'start'
 
         # -- class variables --
         self.last_viewpoints: Viewpoints = None
         self.grid_changed: bool
+        self.viewpoints_changed: bool
+        self.recalculate_paths: bool
+        self.paths_set =  False
         self.state = State.UNSET
-        self._reset_internals()
 
         self.start_pose: Pose
+        self.paths: list[Path] = []
         
         self.last_grid: OccupancyGrid = None
         self.occupancy_matrix: np.ndarray = None
         self.occupied_value = 50
+
+        self._reset_internals()
 
         # -- call other initialisation functions --
         self.init_clients()
@@ -129,6 +134,11 @@ class PathPlanner(Node):
             'path_follower/path_finished',
             callback_group=cb_group
         )
+        self.reduce_K_client = self.create_client(
+            SetBool,
+            'position_controller/scale_K',
+            callback_group=cb_group
+        )
 
     # -------------------------------------
     # ---------- on service call ----------
@@ -138,6 +148,12 @@ class PathPlanner(Node):
         self.get_logger().info(f"Start Position at: {request.target_pose.position.x}, {request.target_pose.position.y}")
         self.state = State.MOVE_TO_START
         self.start_pose = request.target_pose
+        
+        # -- Reduce speed 
+        if self.reduce_K_client.call(SetBool.Request(data=True)).success:
+            self.get_logger().info("-> Reduced speed mode. <-")
+        else:
+            self.get_logger().info("-> Failed to set speed mode. <-")
 
         # -- just use the goal point as the last and only entry in our path --
         header = Header()
@@ -165,6 +181,13 @@ class PathPlanner(Node):
 
     def srv_start(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.get_logger().info("---- NORMAL OPERATION ----")
+        
+        # -- Reduce speed 
+        if self.reduce_K_client.call(SetBool.Request(data=False)).success:
+            self.get_logger().info("-> Normal speed mode. <-")
+        else:
+            self.get_logger().info("-> Failed to set speed mode. <-")
+        
         if self.state != State.NORMAL_OPERATION:
             self.get_logger().info('Starting normal operation.')
             self._reset_internals()
@@ -178,35 +201,36 @@ class PathPlanner(Node):
             self.get_logger().info('Asked to stop. Going to idle mode.')
         response.success = self.do_stop()
         return response
-    
+
     # -----------------------------------------
     # ---------- on subscirber input ----------
     # -----------------------------------------
     def on_viewpoints(self, msg: Viewpoints) -> None:
-        self.get_logger().info("Viewpoints recieved!")
-        self.get_logger().info(f"msg = {msg.viewpoints[0].pose.position.x}")
         if self.state == State.UNSET:
             self.self_do_stop()
         elif self.state == State.MOVE_TO_START:
-            if self.grid_changed:
-                # TODO sorting algorithm
-                pass
-            pass
+            if self.recalculate_paths and self.occupancy_matrix is not None:
+                self.get_logger().info("---------- Sorting ----------")
+                self.paths = self.sorting_algorithm(
+                    viewpoint_msg=msg,
+                    start_pose=self.start_pose,
+                    occupancy_matrix=self.occupancy_matrix
+                )
+                self.recalculate_paths = False
         elif self.state == State.IDLE:
             pass
         elif self.state == State.NORMAL_OPERATION:
             self.self_do_move(viewpoint_msg=msg)
         else:
             self.get_logger().error('BlueRov is in an unknown state!')
-    
+
 
     def on_occupancy_grid(self, msg: OccupancyGrid) -> None:
         if not self._grid_changed(grid=msg):
             return None
-        
+
         self.grid_changed = True
         self.cell_size = msg.info.resolution
-        # NOTE why transpose ??? doesn't work without
         self.occupancy_matrix = self._occupancy_grid_to_matrix(msg).transpose()
         self.get_logger().info("Received Occupancy grid:")
         self.get_logger().info(f"Resolution={msg.info.resolution}, height={msg.info.height}, width={msg.info.width}.")
@@ -217,6 +241,8 @@ class PathPlanner(Node):
     def self_do_stop(self) -> bool:
         self.state = State.IDLE
         self._reset_internals()
+        self.paths = []
+        self.paths_set = False
         response: Trigger.Response = self.path_finished_client.call(Trigger.Request())
         if response.success:
             self.get_logger().info('----- BlueRov stopped! -----')
@@ -227,155 +253,110 @@ class PathPlanner(Node):
 
 
     def self_do_move(self, viewpoint_msg: Viewpoints) -> None:
-        if not self._viewpoints_changed(viewpoints=viewpoint_msg) and not self.grid_changed:
+        if not self._viewpoints_changed(viewpoints=viewpoint_msg):# and not self.grid_changed:
             return None
         
-        self.grid_changed = False
-        
-        num_viewpoints = len(viewpoint_msg.viewpoints)
-        viewpoint: Viewpoint
-        last_viewpoint: Viewpoint
-        index = 0
-        for viewpoint in viewpoint_msg.viewpoints:
-            if not viewpoint.completed: break
-            last_viewpoint = viewpoint
-            index += 1
+        self.viewpoints_changed = True
 
-        # -- All viewpoints have been reached --
-        if index == num_viewpoints:
-            self.get_logger().info('All Viewpoints have been reached. Stopping BlueRov.')
-            self.self_do_stop()
-            return None
+        if viewpoint_msg.viewpoints[0].completed:
+            try:
+                path = self.paths.pop(0)
+            except IndexError:
+                self.get_logger().info('All Viewpoints have been reached. Stopping BlueRov.')
+                self.self_do_stop()
+                return
+            
+            self.get_logger().info("---- Setting next path ----")
 
-        # -- First Viewpoint is handled by service move_to_start --
-        if index > 0:
-            path = self.self_compute_path(
-                start=last_viewpoint.pose,
-                goal=viewpoint.pose
-            )
-        else:
-            self.get_logger().error("This should have been handled by the move to start service")
-            self.self_do_stop()
-            return None
-
-        if not path:
-            self.get_logger().error("Could not compute path. Giving up...")
-            self.self_do_stop()
-            return None
-        
-        response: SetPath.Response = self.set_path_client.call(
-            SetPath.Request(path=path))
-        if response.success:
-            self.get_logger().info("Path has been successfully set.")
-        else:
-            self.get_logger().error("Could not set path")
-            self.self_do_stop()
+            response: SetPath.Response = self.set_path_client.call(
+                SetPath.Request(path=path))
+            if response.success:
+                self.get_logger().info("Path has been successfully set.")
+            else:
+                self.get_logger().error("Could not set path")
+                self.self_do_stop()
 
     # ----------------------------------
     # ---------- Computations ----------
     # ----------------------------------
-    def sorting_algorithm(self, viewpoint_msg: Viewpoints, start_pose: Pose) -> list[Path]:
-        points: list[Point] = []
-        viewpoint: Viewpoint
-        # -- Make sure start poition ist first in index
-        for viewpoint in viewpoint_msg.viewpoints:
-            if viewpoint.pose.position == start_pose.position:
-                points.insert(0, viewpoint.pose.position)
-            else:
-                points.append(viewpoint.pose.position)
+    def sorting_algorithm(self, viewpoint_msg: Viewpoints, start_pose: Pose, occupancy_matrix: np.ndarray) -> list[Path]:
+
+        def traveling_salesman(used_points: list[Point], cost: float, current_point: int, costs: np.ndarray, viewpoints: Viewpoints) -> tuple[list[Point], float]:
+            if len(used_points) == costs.shape[0]: 
+                return (used_points, cost)
+            
+            best_cost = np.inf
+            best_path: list[Path] = []
+            viewpoint: Viewpoint
+            for goal, viewpoint in enumerate(viewpoints.viewpoints):
+                if viewpoint.pose.position in used_points:
+                    continue
+                path, total_cost = traveling_salesman(
+                    used_points=used_points + [viewpoint.pose.position],
+                    cost=cost+costs[current_point, goal],
+                    current_point=goal,
+                    costs=costs,
+                    viewpoints=viewpoints
+                )
+
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    best_path = path
+            
+            return (best_path, best_cost)
         
-        # TODO
+        self.paths_set = True
 
+        self.get_logger().info("----- Findig optimal path -----")
 
-    def self_compute_path(self, start: Pose, goal: Pose, ignore_obstacles: bool = False) -> Path:
-        self.get_logger().info(f"calculating path from ({start.position.x}|{start.position.y}) to ({goal.position.x}|{goal.position.y})")
-        p0 = self._world_to_matrix(start.position.x, start.position.y, self.cell_size)
-        p1 = self._world_to_matrix(goal.position.x, goal.position.y, self.cell_size)
-        
-        # -- Check the input data --
-        try:
-            self.occupancy_matrix[p0[0], p0[1]]
-            self.occupancy_matrix[p1[0], p1[1]]
-        except IndexError:
-            self.get_logger().error(f"Grid shape is {self.occupancy_matrix.shape}.")
-            self.get_logger().error(f"Start ({p0[0]}, {p0[1]}) or finish ({p1[0]}, {p1[1]}) is out of bounds!")
-            return None
+        # -- Calculate all costst and paths in matrix --
+        num_viewpoints = len(viewpoint_msg.viewpoints)
+        costs = np.ones((num_viewpoints, num_viewpoints), dtype=float) * -1.0
+        paths = np.empty((num_viewpoints, num_viewpoints), dtype=Path)
+        for i in range(num_viewpoints):
+            for j in range(num_viewpoints):
+                if costs[i,j] != -1.0: continue
+                if i == j:
+                    costs[i,j] = 0.0
+                    paths[i,j] = None
+                    continue
+                paths[i,j], costs[i,j] = self.method_a_star(
+                    start_pose=viewpoint_msg.viewpoints[i].pose,
+                    goal_pose=viewpoint_msg.viewpoints[j].pose,
+                    obstacles=np.copy(self.occupancy_matrix)
+                )
+                """
+                costs[j,i] = costs[i,j]
+                paths[j,i] = paths[i,j]
+                paths[j,i].poses = paths[j,i].poses[::-1]
+                """
 
-        # ---- Insert Method function here ----
-        points_n = self.method_a_star(
-            p0=p0,
-            p1=p1,
-            obstacles=np.copy(self.occupancy_matrix),
-            ignore_obstacles=ignore_obstacles
+        # -- Calculate ideal order of points --
+        points, total_cost = traveling_salesman(
+            used_points=[viewpoint_msg.viewpoints[0].pose.position],
+            cost=0.0,
+            current_point=0,
+            costs=costs,
+            viewpoints=viewpoint_msg
         )
 
-        # -- Method function returns None if failed --
-        if not points_n: return None
+        # -- Get ideal path --
+        path: list[Path] = []
+        viewpoint: Viewpoint
+        for start, goal in zip(points[:-1], points[1:]):
+            for n, viewpoint in enumerate(viewpoint_msg.viewpoints):
+                if viewpoint.pose.position == start:
+                    i=n
+                if viewpoint.pose.position == goal:
+                    j=n
+            path.append(paths[i,j])
 
-        # -- Convert discrete points back to world coordinates --
-        world_points = [
-            self._matrix_to_world(p_n[0], p_n[1], self.cell_size)
-            for p_n in points_n
-        ]
-
-        # -- How will the robot be orientated along the path --
-        num_path_points = len(world_points)
-        world_orientation: list[Quaternion] = []
-        if self.orientation_method == 'const_change' and num_path_points > 1:
-            # -- Robot will constantly rotate along path --
-            _, _, yaw0 = euler_from_quaternion([
-                start.orientation.x,
-                start.orientation.y,
-                start.orientation.z,
-                start.orientation.w,
-            ])
-            _, _, yaw1 = euler_from_quaternion([
-                goal.orientation.x,
-                goal.orientation.y,
-                goal.orientation.z,
-                goal.orientation.w,
-            ])
-
-            d_yaw, dir = self._find_shortest_angle_and_dir(yaw0, yaw1)
-            d_yaw_per_step = d_yaw / (num_path_points-1)    # num_path_points must be > 1
-            for n in range(num_path_points):
-                if dir == 'clockwise':
-                    qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 + (n*d_yaw_per_step))
-                elif dir == 'anticlockwise':
-                    qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 - (n*d_yaw_per_step))
-                world_orientation.append(Quaternion(x=qx, y= qy, z=qz, w=qw))
-        elif self.orientation_method == 'start':
-            # -- Robot will keep constant starting orientation and turn at the end --
-            for n in range(num_path_points):
-                world_orientation.append(start.orientation)
-        else:
-            # -- Robot wil turn at the start and keep constant goal orientation --
-            for n in range(num_path_points):
-                world_orientation.append(goal.orientation)
-        
-        # -- make sure the last orientation is the goal orientation --
-        world_orientation[-1] = goal.orientation
-
-        # -- Format output --
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = 'map'
-        
-        path = Path()
-        path.header = header
-        path.poses = [
-            PoseStamped(
-                header=header,
-                pose=Pose(
-                    position=Point(x=p[0], y=p[1], z=Z_PLAIN),
-                    orientation=q,
-                )
-            ) for p, q in zip(world_points, world_orientation) ]
+        self.get_logger().info(f"----- Found optimal path containing {len(paths)} paths ({total_cost:.4f}m) -----")
 
         return path
 
     
-    def method_a_star(self, p0: list[int, int], p1: list[int, int], obstacles: np.ndarray, ignore_obstacles: bool = False) -> list[list[int, int]]:
+    def method_a_star(self, start_pose: Pose, goal_pose: Pose, obstacles: np.ndarray, ignore_obstacles: bool = False) -> tuple[Path, float]:
         
         def insert_in_stack(stack: list[AStarCell], new: AStarCell) -> list[AStarCell]:
             if not stack: return [new]
@@ -400,13 +381,16 @@ class PathPlanner(Node):
                     return stack
             self.get_logger().error("A* Alg.: Could not find item to delete!")
         
-        self.get_logger().info("---- A* is calculating a path ----")
+        self.get_logger().info("-- A* is calculating a path --")
+
+        start = self._world_point_to_matrix(start_pose.position, self.cell_size)
+        goal = self._world_point_to_matrix(goal_pose.position, self.cell_size)
 
         map = np.empty(obstacles.shape, dtype=AStarCell)
-        map[p0[0], p0[1]] = AStarCell(pos=p0, start=p0, finish=p1, visited=True, parent=None)
+        map[start.x, start.y] = AStarCell(pos=start, start=start, finish=goal, visited=True, parent=None)
         stack = []
-        p: AStarCell = map[p0[0], p0[1]]
-        while p.pos != p1:
+        p: AStarCell = map[start.x, start.y]
+        while p.pos != goal:
             # ---- Check all surrounding cells ----
             for x in range(p.x - 1, p.x + 2):
                 for y in range(p.y - 1, p.y + 2):
@@ -424,7 +408,7 @@ class PathPlanner(Node):
 
                     # -- Immediately use empty cells --
                     if map[x, y] == None:
-                        map[x, y] = AStarCell(pos=[x, y], start=p0, finish=p1, visited=False, parent=p)
+                        map[x, y] = AStarCell(pos=Point(x=x, y=y, z= Z_PLAIN), start=start, finish=goal, visited=False, parent=p)
                         stack = insert_in_stack(stack=stack, new=map[x, y])
                         continue
                     
@@ -433,7 +417,7 @@ class PathPlanner(Node):
                         continue
 
                     # -- Take the 'better' path --
-                    new_pos = AStarCell(pos=[x,y],start=p0, finish=p1, visited=False, parent=p)
+                    new_pos = AStarCell(pos=Point(x=x, y=y, z=Z_PLAIN), start=start, finish=goal, visited=False, parent=p)
                     if new_pos.f_cost < map[x,y].f_cost:
                         map[x,y] = new_pos
                         stack = find_and_del(stack=stack, to_del=new_pos)
@@ -448,13 +432,89 @@ class PathPlanner(Node):
                 return None
             map[p.x, p.y].visited = True
 
-        # ---- Return frfom goal to start ----
-        path = [map[p1[0], p1[1]].pos]
-        while p.pos != p0:
-            path.append(p.parent.pos)
+        # ---- Return from goal to start ----
+        points = [goal]
+        while p.pos != start:
+            points.append(p.parent.pos)
             p = p.parent
+
+        orientations = self.compute_orientation(
+            start=start_pose.orientation,
+            goal=goal_pose.orientation,
+            len_points=len(points),
+        )
         
-        return path[::-1]
+        header = Header(
+            stamp=self.get_clock().now().to_msg(),
+            frame_id='n_map'
+        )
+        path = Path(
+            header=header,
+            poses=[PoseStamped(
+                header=header,
+                pose=Pose(
+                    position=self._matrix_point_to_world(point, self.cell_size),
+                    orientation=orientation
+                )
+            ) for point, orientation in zip(points[::-1], orientations) ]
+        )
+        
+        cost = map[goal.x, goal.y].f_cost * 0.05
+        self.get_logger().info(f"-- A* finished: {len(path.poses)} tiles ({cost:.4f}m)")
+        return (path, cost)
+
+
+    def compute_orientation(self, start: Quaternion, goal: Quaternion, len_points: int) -> list[Quaternion]:
+        orientations: list[Quaternion] = []
+        if self.orientation_method == 'const_change' and len_points > 1:
+            # -- Robot will constantly rotate along path --
+            _, _, yaw0 = euler_from_quaternion([start.x, start.y, start.z, start.w])
+            _, _, yaw1 = euler_from_quaternion([goal.x, goal.y, goal.z, goal.w])
+            
+            d_yaw, dir = self._find_shortest_angle_and_dir(yaw0, yaw1)
+            yaw_per_step = d_yaw / (len_points-1)
+            
+            for n in range(len_points):
+                if dir == 'clockwise':
+                    qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 + (n*yaw_per_step))
+                elif dir == 'anticlockwise':
+                    qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 - (n*yaw_per_step))
+                orientations.append(Quaternion(x=qx, y=qy, z=qz, w=qw))
+        elif self.orientation_method == 'first_3rd':
+            _, _, yaw0 = euler_from_quaternion([start.x, start.y, start.z, start.w])
+            _, _, yaw1 = euler_from_quaternion([goal.x, goal.y, goal.z, goal.w])
+
+            len_turning = round(len_points - ((1/3) * len_points))
+            len_const = len_points - len_turning
+
+            d_yaw, dir = self._find_shortest_angle_and_dir(yaw0, yaw1)
+            yaw_per_step = d_yaw / (len_turning-1)
+
+            for n in range(len_points):
+                if dir == 'clockwise':
+                    qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 + (n*yaw_per_step))
+                elif dir == 'anticlockwise':
+                    qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 - (n*yaw_per_step))
+                orientations.append(Quaternion(x=qx, y=qy, z=qz, w=qw))
+                self.get_logger().info(f"Orientation = {yaw0 - (n*yaw_per_step)}")
+            
+            for n in range(len_const):
+                orientations.append(goal)
+                self.get_logger().info(f"Orientation = {goal.z}")
+
+        elif self.orientation_method == 'start':
+            # -- Robot will keep constant starting orientation and turn at the end --
+            for n in range(len_points):
+                orientations.append(start)
+        else:
+            # -- Robot wil turn at the start and keep constant goal orientation --
+            for n in range(len_points):
+                orientations.append(goal)
+                self.get_logger().info(f"Orientation = {goal.z}")
+        
+        # -- make sure the last orientation is the goal orientation --
+        orientations[-1] = goal
+        return orientations
 
     # ---------------------------
     # ---------- Other ----------
@@ -468,6 +528,8 @@ class PathPlanner(Node):
 
     def _reset_internals(self) -> None:
         self.grid_changed = True
+        self.viewpoints_changed = True
+        self.recalculate_paths = True
 
     def _grid_changed(self, grid: OccupancyGrid) -> bool:
         # -- If None type OccupancyGrid hasnt been initialized yet --
@@ -538,6 +600,7 @@ class PathPlanner(Node):
                 self.get_logger().info(f"Viewpoint {n}s orientation changed. Recalculating path.")
                 return True
         
+        self.viewpoints_changed = False
         self.last_viewpoints = viewpoints
         return False
 
@@ -546,12 +609,11 @@ class PathPlanner(Node):
         data = data.reshape(grid.info.height, grid.info.width)
         return data
 
-    def _world_to_matrix(self, x: float, y:float, grid_size: float) -> list[int, int]:
-        return [round(x/grid_size), round(y/grid_size)]
-    
-    def _matrix_to_world(self, x: int, y: int, grid_size: float) -> list[float]:
-        return [x*grid_size, y*grid_size]
-            
+    def _world_point_to_matrix(self, p: Point, grid_size: float) -> Point:
+        return Point(x=round(p.x/grid_size), y=round(p.y/grid_size), z=Z_PLAIN)
+
+    def _matrix_point_to_world(self, p: Point, grid_size: float) -> Point:
+        return Point(x=p.x*grid_size, y=p.y*grid_size, z=Z_PLAIN)
 
 
 def main():

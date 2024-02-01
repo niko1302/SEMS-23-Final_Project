@@ -11,7 +11,7 @@ from scenario_msgs.msg import PolygonsStamped
 
 OCCUPIED = 100
 DEPTH = -0.5            # [m]
-INFLATION_SIZE = 0.3    # [m]
+INFLATION_SIZE = 0.65    # [m]
 
 
 class MapperNode(Node):

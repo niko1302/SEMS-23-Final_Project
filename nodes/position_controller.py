@@ -19,10 +19,14 @@ class PositionController(Node):
     def __init__(self):
         super().__init__(node_name='position_controller')
 
+        # -- Parameter variables --
         self.Kp = {'x': 0.0, 'y': 0.0, 'z': 0.0}
         self.Kd = {'x': 0.0, 'y': 0.0, 'z': 0.0}
-        self.beta = 0.2
+        self.beta: float
+        self.scale_Kp_by: float
+        self.scale_Kd_by: float
 
+        # -- internal class variables --
         self.last_time = self.get_clock().now()
         self.last_x_error = 0.0
         self.last_y_error = 0.0
@@ -33,7 +37,6 @@ class PositionController(Node):
 
         self.setpoint = Point()
         self.setpoint_timed_out = True
-        self.pose_counter = 0
 
         # -- Parameters --
         self.init_params()
@@ -72,10 +75,10 @@ class PositionController(Node):
         )
 
         # -- Services --
-        self.reduce_K_srv = self.create_service(
+        self.scale_K_srv = self.create_service(
             SetBool,
             '~/scale_K',
-            self.srv_accel,
+            self.srv_scale_K,
         )
         
         # -- Timers --
@@ -92,6 +95,9 @@ class PositionController(Node):
                 ('d_gain.x', rclpy.Parameter.Type.DOUBLE),
                 ('d_gain.y', rclpy.Parameter.Type.DOUBLE),
                 ('d_gain.z', rclpy.Parameter.Type.DOUBLE),
+                ('beta', rclpy.Parameter.Type.DOUBLE),
+                ('scale_Kp_by', rclpy.Parameter.Type.DOUBLE),
+                ('scale_Kd_by', rclpy.Parameter.Type.DOUBLE),
             ]
         )
 
@@ -119,17 +125,17 @@ class PositionController(Node):
         self.get_logger().info(f'{param.name}={param.value}')
         self.Kd['z'] = param.value
 
+        param = self.get_parameter('beta')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.beta = param.value
 
-    def srv_accel(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
-        if request.data:
-            self.Kp_scale = SCALE_KP_BY
-            self.Kd_scale = SCALE_KD_BY
-        else:
-            self.Kp_scale = 1.0
-            self.Kd_scale = 1.0
+        param = self.get_parameter('scale_Kp_by')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.scale_Kp_by = param.value
 
-        response.success = True
-        return response
+        param = self.get_parameter('scale_Kd_by')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.scale_Kd_by = param.value
 
 
     def on_params_changed(self, params) -> SetParametersResult:
@@ -148,9 +154,27 @@ class PositionController(Node):
                 self.Kd['y'] = param.value
             elif param.name == 'd_gain.z':
                 self.Kd['z'] = param.value
+            elif param.name == 'beta':
+                self.beta = param.value
+            elif param.name == 'scale_Kp_by':
+                self.scale_Kp_by = param.value
+            elif param.name == 'scale_Kd_by':
+                self.scale_Kd_by = param.value
             else:
                 self.get_logger().warning('Did not find parameter!')
         return SetParametersResult(successful= True, reason='Parameter set!')
+
+
+    def srv_scale_K(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+        if request.data:
+            self.Kp_scale = SCALE_KP_BY
+            self.Kd_scale = SCALE_KD_BY
+        else:
+            self.Kp_scale = 1.0
+            self.Kd_scale = 1.0
+
+        response.success = True
+        return response
 
 
     def on_setpoint_timeout(self):

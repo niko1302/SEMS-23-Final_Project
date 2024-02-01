@@ -6,6 +6,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from hippo_msgs.msg import ActuatorSetpoint, Float64Stamped
 from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
+from std_srvs.srv import SetBool
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from tf_transformations import euler_from_quaternion
 
@@ -22,14 +23,20 @@ class YawController(Node):
             depth=1
         )
 
-        # -- Parameter --
+        # -- Parameter variables --
         self.Kp: float
         self.Kd: float
         self.Ki: float
         self.i_shutoff: float
         self.beta: float
+        self.scale_Kp_by: float
+        self.scale_Kd_by: float
+        self.scale_Ki_by: float
 
         # -- internal class variables --
+        self.Kp_scale = 1.0
+        self.Kd_scale = 1.0
+        self.Ki_scale = 1.0
         self.i_error = 0.0
         self.last_error = 0.0
         self.last_time = self.get_clock().now()
@@ -74,6 +81,13 @@ class YawController(Node):
                 topic='~/filtered_error',
                 qos_profile=1
             )
+        
+        # -- Services --
+        self.scale_K_srv = self.create_service(
+            SetBool,
+            '~/scale_K',
+            self.srv_scale_K,
+        )
 
     def init_params(self) -> None:
         self.declare_parameters(
@@ -84,6 +98,9 @@ class YawController(Node):
                 ('i_gain', rclpy.Parameter.Type.DOUBLE),
                 ('i_shutoff', rclpy.Parameter.Type.DOUBLE),
                 ('beta', rclpy.Parameter.Type.DOUBLE),
+                ('scale_Kp_by', rclpy.Parameter.Type.DOUBLE),
+                ('scale_Kd_by', rclpy.Parameter.Type.DOUBLE),
+                ('scale_Ki_by', rclpy.Parameter.Type.DOUBLE),
             ]
         )
 
@@ -107,6 +124,18 @@ class YawController(Node):
         self.get_logger().info(f'{param.name}={param.value}')
         self.beta = param.value
 
+        param = self.get_parameter('scale_Kp_by')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.scale_Kp_by = param.value
+
+        param = self.get_parameter('scale_Kd_by')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.scale_Kd_by = param.value
+
+        param = self.get_parameter('scale_Ki_by')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.scale_Ki_by = param.value
+
 
     def on_params_changed(self, params) -> SetParametersResult:
         param: rclpy.Parameter
@@ -122,9 +151,29 @@ class YawController(Node):
                 self.i_shutoff = param.value
             elif param.name == 'beta':
                 self.beta = param.value
+            elif param.name == 'scale_Kp_by':
+                self.scale_Kp_by = param.value
+            elif param.name == 'scale_Kd_by':
+                self.scale_Kd_by = param.value
+            elif param.name == 'scale_Ki_by':
+                self.scale_Ki_by = param.value
             else:
                 self.get_logger().warning('Did not find parameter!')
         return SetParametersResult(successful= True, reason='Parameter set!')
+
+
+    def srv_scale_K(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+        if request.data:
+            self.Kp_scale = self.scale_Kp_by
+            self.Kd_scale = self.scale_Kd_by
+            self.Ki_scale = self.scale_Ki_by
+        else:
+            self.Kp_scale = 1.0
+            self.Kd_scale = 1.0
+            self.Ki_scale = 1.0
+
+        response.success = True
+        return response
 
 
     def on_setpoint_timeout(self):
@@ -194,7 +243,10 @@ class YawController(Node):
         else:
             self.i_error = 0
 
-        yaw_thrust = self.Kp * error + self.Kd * d_error + self.Ki * self.i_error
+        yaw_thrust = (
+            (self.Kp*self.Kp_scale) * error) + (
+            (self.Kd*self.Kd_scale) * d_error) + (
+            (self.Ki*self.Ki_scale) * self.i_error)
 
         return yaw_thrust
 

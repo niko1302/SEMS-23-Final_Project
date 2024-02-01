@@ -64,14 +64,13 @@ class PathPlanner(Node):
         
         # -- node settings --
         self.cell_size = 0.2
-        self.orientation_method = 'const_change' # 'first_3rd', 'const_change', 'goal', 'start'
+        self.orientation_method = 'last_3rd' # 'first_3rd', 'const_change', 'goal', 'start'
 
         # -- class variables --
         self.last_viewpoints: Viewpoints = None
         self.grid_changed: bool
         self.viewpoints_changed: bool
-        self.recalculate_paths: bool
-        self.paths_set =  False
+        self.calculate_paths: bool
         self.state = State.UNSET
 
         self.start_pose: Pose
@@ -134,9 +133,14 @@ class PathPlanner(Node):
             'path_follower/path_finished',
             callback_group=cb_group
         )
-        self.reduce_K_client = self.create_client(
+        self.reduce_pos_K_client = self.create_client(
             SetBool,
             'position_controller/scale_K',
+            callback_group=cb_group
+        )
+        self.reduce_yaw_K_client = self.create_client(
+            SetBool,
+            'yaw_controller/scale_K',
             callback_group=cb_group
         )
 
@@ -149,11 +153,18 @@ class PathPlanner(Node):
         self.state = State.MOVE_TO_START
         self.start_pose = request.target_pose
         
-        # -- Reduce speed 
-        if self.reduce_K_client.call(SetBool.Request(data=True)).success:
-            self.get_logger().info("-> Reduced speed mode. <-")
+        
+        # -- Reduce position controller speed 
+        if self.reduce_pos_K_client.call(SetBool.Request(data=True)).success:
+            self.get_logger().info("-> Reduced pos speed mode. <-")
         else:
-            self.get_logger().info("-> Failed to set speed mode. <-")
+            self.get_logger().info("-> Failed to set pos speed mode. <-")
+        
+        # -- Reduce yaw controller speed 
+        if self.reduce_yaw_K_client.call(SetBool.Request(data=True)).success:
+            self.get_logger().info("-> Reduced yaw speed mode. <-")
+        else:
+            self.get_logger().info("-> Failed to set yaw speed mode. <-")
 
         # -- just use the goal point as the last and only entry in our path --
         header = Header()
@@ -182,8 +193,15 @@ class PathPlanner(Node):
     def srv_start(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.get_logger().info("---- NORMAL OPERATION ----")
         
-        # -- Reduce speed 
-        if self.reduce_K_client.call(SetBool.Request(data=False)).success:
+        
+        # -- Return position controller speed to normal
+        if self.reduce_pos_K_client.call(SetBool.Request(data=False)).success:
+            self.get_logger().info("-> Normal speed mode. <-")
+        else:
+            self.get_logger().info("-> Failed to set speed mode. <-")
+        
+        # -- Return yaw controller speed to normal
+        if self.reduce_yaw_K_client.call(SetBool.Request(data=False)).success:
             self.get_logger().info("-> Normal speed mode. <-")
         else:
             self.get_logger().info("-> Failed to set speed mode. <-")
@@ -209,27 +227,29 @@ class PathPlanner(Node):
         if self.state == State.UNSET:
             self.self_do_stop()
         elif self.state == State.MOVE_TO_START:
-            if self.recalculate_paths and self.occupancy_matrix is not None:
+            if self.calculate_paths and self.occupancy_matrix is not None:
                 self.get_logger().info("---------- Sorting ----------")
                 self.paths = self.sorting_algorithm(
                     viewpoint_msg=msg,
                     start_pose=self.start_pose,
                     occupancy_matrix=self.occupancy_matrix
                 )
-                self.recalculate_paths = False
+                self.calculate_paths = False
         elif self.state == State.IDLE:
             pass
         elif self.state == State.NORMAL_OPERATION:
-            self.self_do_move(viewpoint_msg=msg)
+            self.viewpoints_changed = self._viewpoints_changed(viewpoints=msg)
+            if self.viewpoints_changed:
+                self.self_do_move(viewpoint_msg=msg)
         else:
             self.get_logger().error('BlueRov is in an unknown state!')
 
 
     def on_occupancy_grid(self, msg: OccupancyGrid) -> None:
-        if not self._grid_changed(grid=msg):
+        self.grid_changed = self._grid_changed(grid=msg)
+        if not self.grid_changed:
             return None
 
-        self.grid_changed = True
         self.cell_size = msg.info.resolution
         self.occupancy_matrix = self._occupancy_grid_to_matrix(msg).transpose()
         self.get_logger().info("Received Occupancy grid:")
@@ -242,7 +262,6 @@ class PathPlanner(Node):
         self.state = State.IDLE
         self._reset_internals()
         self.paths = []
-        self.paths_set = False
         response: Trigger.Response = self.path_finished_client.call(Trigger.Request())
         if response.success:
             self.get_logger().info('----- BlueRov stopped! -----')
@@ -253,11 +272,6 @@ class PathPlanner(Node):
 
 
     def self_do_move(self, viewpoint_msg: Viewpoints) -> None:
-        if not self._viewpoints_changed(viewpoints=viewpoint_msg):# and not self.grid_changed:
-            return None
-        
-        self.viewpoints_changed = True
-
         if viewpoint_msg.viewpoints[0].completed:
             try:
                 path = self.paths.pop(0)
@@ -304,8 +318,6 @@ class PathPlanner(Node):
                     best_path = path
             
             return (best_path, best_cost)
-        
-        self.paths_set = True
 
         self.get_logger().info("----- Findig optimal path -----")
 
@@ -392,15 +404,15 @@ class PathPlanner(Node):
         p: AStarCell = map[start.x, start.y]
         while p.pos != goal:
             # ---- Check all surrounding cells ----
-            for x in range(p.x - 1, p.x + 2):
-                for y in range(p.y - 1, p.y + 2):
+            for x in range(p.x - 1, p.x + 2):       # x = (p.x - 1), p.x, (p.x + 1)
+                for y in range(p.y - 1, p.y + 2):   # y = (p.y - 1), p.y, (p.y + 1)
                     # -- Ignore itself --
                     if x == p.x and y == p.y: 
                         continue
                     
                     # -- Ignore obstacle cells --
                     try:
-                        obstacles[x, y] # Enforce to check even if ignore_obstcales
+                        obstacles[x, y] # Enforce to check even if ignore_obstcales is true
                         value = obstacles[x, y] if not ignore_obstacles else 0
                         if value > self.occupied_value: continue
                     except IndexError:
@@ -480,7 +492,7 @@ class PathPlanner(Node):
                 elif dir == 'anticlockwise':
                     qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 - (n*yaw_per_step))
                 orientations.append(Quaternion(x=qx, y=qy, z=qz, w=qw))
-        elif self.orientation_method == 'first_3rd':
+        elif self.orientation_method == 'last_3rd':
             _, _, yaw0 = euler_from_quaternion([start.x, start.y, start.z, start.w])
             _, _, yaw1 = euler_from_quaternion([goal.x, goal.y, goal.z, goal.w])
 
@@ -490,17 +502,15 @@ class PathPlanner(Node):
             d_yaw, dir = self._find_shortest_angle_and_dir(yaw0, yaw1)
             yaw_per_step = d_yaw / (len_turning-1)
 
-            for n in range(len_points):
+            for n in range(len_turning):
                 if dir == 'clockwise':
                     qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 + (n*yaw_per_step))
                 elif dir == 'anticlockwise':
                     qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 - (n*yaw_per_step))
                 orientations.append(Quaternion(x=qx, y=qy, z=qz, w=qw))
-                self.get_logger().info(f"Orientation = {yaw0 - (n*yaw_per_step)}")
             
             for n in range(len_const):
                 orientations.append(goal)
-                self.get_logger().info(f"Orientation = {goal.z}")
 
         elif self.orientation_method == 'start':
             # -- Robot will keep constant starting orientation and turn at the end --
@@ -529,7 +539,7 @@ class PathPlanner(Node):
     def _reset_internals(self) -> None:
         self.grid_changed = True
         self.viewpoints_changed = True
-        self.recalculate_paths = True
+        self.calculate_paths = True
 
     def _grid_changed(self, grid: OccupancyGrid) -> bool:
         # -- If None type OccupancyGrid hasnt been initialized yet --

@@ -89,6 +89,7 @@ class YawController(Node):
             self.srv_scale_K,
         )
 
+
     def init_params(self) -> None:
         self.declare_parameters(
             namespace='',
@@ -176,12 +177,13 @@ class YawController(Node):
         return response
 
 
-    def on_setpoint_timeout(self):
+    def on_setpoint_timeout(self) -> None:
         self.timeout_timer.cancel()
         self.get_logger().warn('Setpoint timed out. Waiting for new setpoints')
         self.setpoint_timed_out = True
 
-    def wrap_pi(self, value: float):
+
+    def wrap_pi(self, value: float) -> float:
         """Normalize the angle to the range [-pi; pi]."""
         if (-math.pi < value) and (value < math.pi):
             return value
@@ -189,14 +191,16 @@ class YawController(Node):
         num_wraps = math.floor((value + math.pi) / range)
         return value - range * num_wraps
 
-    def on_setpoint(self, msg: Float64Stamped):
+
+    def on_setpoint(self, msg: Float64Stamped) -> None:
         self.timeout_timer.reset()
         if self.setpoint_timed_out:
             self.get_logger().info('Setpoint received! Getting back to work.')
         self.setpoint_timed_out = False
         self.setpoint = self.wrap_pi(msg.data)
 
-    def on_vision_pose(self, msg: PoseWithCovarianceStamped):
+
+    def on_vision_pose(self, msg: PoseWithCovarianceStamped) -> None:
         if self.setpoint_timed_out:
             return
         # get the vehicle orientation expressed as quaternion
@@ -209,7 +213,8 @@ class YawController(Node):
         timestamp = rclpy.time.Time.from_msg(msg.header.stamp)
         self.publish_control_output(control_output, timestamp)
 
-    def compute_control_output(self, yaw):
+
+    def compute_control_output(self, yaw) -> float:
         # very important: normalize the angle error!
         error = self.wrap_pi(self.setpoint - yaw)
 
@@ -250,7 +255,8 @@ class YawController(Node):
 
         return yaw_thrust
 
-    def publish_control_output(self, control_output: float, timestamp: rclpy.time.Time):
+
+    def publish_control_output(self, control_output: float, timestamp: rclpy.time.Time) -> None:
         msg = ActuatorSetpoint()
         msg.header.stamp = timestamp.to_msg()
         msg.ignore_x = True

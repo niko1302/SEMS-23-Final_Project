@@ -4,16 +4,17 @@ from enum import Enum, auto
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
-from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
+from nav_msgs.msg import OccupancyGrid, Path
 from scenario_msgs.msg import Viewpoints, Viewpoint
 from scenario_msgs.srv import MoveToStart, SetPath
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger, SetBool
+
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
-from visualization_msgs.msg import Marker
 
 
 Z_PLAIN = -0.5
@@ -64,7 +65,7 @@ class PathPlanner(Node):
         
         # -- node settings --
         self.cell_size = 0.2
-        self.orientation_method = 'last_3rd' # 'first_3rd', 'const_change', 'goal', 'start'
+        self.orientation_method = 'last_3rd' # 'last_3rd', 'const_change', 'goal', 'start'
 
         # -- class variables --
         self.last_viewpoints: Viewpoints = None
@@ -225,7 +226,7 @@ class PathPlanner(Node):
     # -----------------------------------------
     def on_viewpoints(self, msg: Viewpoints) -> None:
         if self.state == State.UNSET:
-            self.self_do_stop()
+            self.do_stop()
         elif self.state == State.MOVE_TO_START:
             if self.calculate_paths and self.occupancy_matrix is not None:
                 self.get_logger().info("---------- Sorting ----------")
@@ -240,7 +241,7 @@ class PathPlanner(Node):
         elif self.state == State.NORMAL_OPERATION:
             self.viewpoints_changed = self._viewpoints_changed(viewpoints=msg)
             if self.viewpoints_changed:
-                self.self_do_move(viewpoint_msg=msg)
+                self.do_move(viewpoint_msg=msg)
         else:
             self.get_logger().error('BlueRov is in an unknown state!')
 
@@ -258,7 +259,7 @@ class PathPlanner(Node):
     # --------------------------------
     # ---------- Operations ----------
     # --------------------------------
-    def self_do_stop(self) -> bool:
+    def do_stop(self) -> bool:
         self.state = State.IDLE
         self._reset_internals()
         self.paths = []
@@ -271,13 +272,13 @@ class PathPlanner(Node):
             return False
 
 
-    def self_do_move(self, viewpoint_msg: Viewpoints) -> None:
+    def do_move(self, viewpoint_msg: Viewpoints) -> None:
         if viewpoint_msg.viewpoints[0].completed:
             try:
                 path = self.paths.pop(0)
             except IndexError:
                 self.get_logger().info('All Viewpoints have been reached. Stopping BlueRov.')
-                self.self_do_stop()
+                self.do_stop()
                 return
             
             self.get_logger().info("---- Setting next path ----")
@@ -288,7 +289,7 @@ class PathPlanner(Node):
                 self.get_logger().info("Path has been successfully set.")
             else:
                 self.get_logger().error("Could not set path")
-                self.self_do_stop()
+                self.do_stop()
 
     # ----------------------------------
     # ---------- Computations ----------
@@ -323,11 +324,10 @@ class PathPlanner(Node):
 
         # -- Calculate all costst and paths in matrix --
         num_viewpoints = len(viewpoint_msg.viewpoints)
-        costs = np.ones((num_viewpoints, num_viewpoints), dtype=float) * -1.0
+        costs = np.ones((num_viewpoints, num_viewpoints), dtype=float)
         paths = np.empty((num_viewpoints, num_viewpoints), dtype=Path)
         for i in range(num_viewpoints):
             for j in range(num_viewpoints):
-                if costs[i,j] != -1.0: continue
                 if i == j:
                     costs[i,j] = 0.0
                     paths[i,j] = None
@@ -337,11 +337,6 @@ class PathPlanner(Node):
                     goal_pose=viewpoint_msg.viewpoints[j].pose,
                     obstacles=np.copy(self.occupancy_matrix)
                 )
-                """
-                costs[j,i] = costs[i,j]
-                paths[j,i] = paths[i,j]
-                paths[j,i].poses = paths[j,i].poses[::-1]
-                """
 
         # -- Calculate ideal order of points --
         points, total_cost = traveling_salesman(

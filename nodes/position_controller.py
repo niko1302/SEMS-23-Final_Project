@@ -11,8 +11,6 @@ from std_srvs.srv import SetBool
 from tf_transformations import euler_from_quaternion
 
 PUBLISH_ERROR = True
-SCALE_KP_BY = 0.6
-SCALE_KD_BY = 0.6
 
 class PositionController(Node):
 
@@ -167,8 +165,8 @@ class PositionController(Node):
 
     def srv_scale_K(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
         if request.data:
-            self.Kp_scale = SCALE_KP_BY
-            self.Kd_scale = SCALE_KD_BY
+            self.Kp_scale = self.scale_Kp_by
+            self.Kd_scale = self.scale_Kd_by
         else:
             self.Kp_scale = 1.0
             self.Kd_scale = 1.0
@@ -177,13 +175,13 @@ class PositionController(Node):
         return response
 
 
-    def on_setpoint_timeout(self):
+    def on_setpoint_timeout(self) -> None:
         self.timeout_timer.cancel()
         self.get_logger().warn('setpoint timed out. waiting for new setpoints.')
         self.setpoint_timed_out = True
 
 
-    def on_position_setpoint(self, msg: PointStamped):
+    def on_position_setpoint(self, msg: PointStamped) -> None:
         self.timeout_timer.reset()
         if self.setpoint_timed_out:
             self.get_logger().info('Setpoint received! Getting back to work.')
@@ -191,7 +189,7 @@ class PositionController(Node):
         self.setpoint = msg.point
 
 
-    def on_pose(self, msg: PoseWithCovarianceStamped):
+    def on_pose(self, msg: PoseWithCovarianceStamped) -> None:
         if self.setpoint_timed_out:
             return
         position = msg.pose.pose.position
@@ -200,8 +198,10 @@ class PositionController(Node):
         self.apply_control(position, yaw)
 
 
-    def apply_control(self, position: Point, yaw: float):
+    def apply_control(self, position: Point, yaw: float) -> None:
         now = self.get_clock().now()
+        
+        # -- Calculate real error --
         x_error = self.setpoint.x - position.x
         y_error = self.setpoint.y - position.y
         z_error = self.setpoint.z - position.z
@@ -213,10 +213,12 @@ class PositionController(Node):
             error_msg.z = z_error
             self.error_pub.publish(error_msg)
 
+        # -- Filter error to reduce noise --
         x_error = (x_error*self.beta) + ((1.0-self.beta) * self.last_x_error)
         y_error = (y_error*self.beta) + ((1.0-self.beta) * self.last_y_error)
         z_error = (z_error*self.beta) + ((1.0-self.beta) * self.last_z_error)
 
+        # -- Caclulate/Linearize derivation of error --
         dt = (now - self.last_time).nanoseconds * 1e-9
         try:
             dx_error = (x_error - self.last_x_error) / dt
@@ -228,10 +230,12 @@ class PositionController(Node):
             dy_error = 0.0
             dz_error = 0.0
 
+        # -- Calculate thrust in tank coordinates --
         x = (self.Kp['x'] * self.Kp_scale) * x_error + (self.Kd['x'] * self.Kd_scale) * dx_error
         y = (self.Kp['y'] * self.Kp_scale) * y_error + (self.Kd['y'] * self.Kd_scale) * dy_error
         z = (self.Kp['z'] * self.Kp_scale) * z_error + (self.Kd['z'] * self.Kd_scale) * dz_error
 
+        # -- Convert thrust in tank coordinates to robot coordinates --
         msg = ActuatorSetpoint()
         msg.header.stamp = now.to_msg()
         msg.x = math.cos(-yaw) * x - math.sin(-yaw) * y
@@ -240,6 +244,15 @@ class PositionController(Node):
         msg.y = min(0.5, max(-0.5, msg.y))
         msg.z = z
 
+        # -- Cap thrust output -- 
+        if msg.x > 1.0: msg.x = 1.0
+        if msg.x < -1.0: msg.x = -1.0
+        if msg.y > 1.0: msg.y = 1.0
+        if msg.y < -1.0: msg.y = -1.0
+        if msg.z > 1.0: msg.z = 1.0
+        if msg.z < -1.0: msg.z = -1.0
+        
+        # -- Update last errors --
         self.last_x_error = x_error
         self.last_y_error = y_error
         self.last_z_error = z_error
@@ -252,7 +265,7 @@ class PositionController(Node):
             filtered_msg.z = z_error
             self.filtered_error_pub.publish(filtered_msg)
 
-
+        # -- Publish thrust putput --
         self.thrust_pub.publish(msg)
 
 

@@ -54,6 +54,34 @@ class AStarCell:
         dy = abs(p1.y - p0.y)
         return (np.sqrt(2)*dy + (dx-dy)) if dy <= dx else (np.sqrt(2)*dx + (dy-dx))
 
+    def __str__(self) -> str:
+        return f"({self.x}, {self.y}): {self.g_cost:.4f} + {self.h_cost:.4f} = {self.f_cost:.4f}"
+
+
+class NikoStarCell:
+    def __init__(self, pos: Point, start: Point, goal: Point, visited: bool, parent: object = None) -> None:
+        self.pos = pos
+        self.x = int(pos.x)
+        self.y = int(pos.y)
+
+        self.parent = parent
+
+        if self.parent is None:
+            self.g_cost = self.__calc_cost(p0=start, p1=pos)
+        else:
+            self.g_cost = self.parent.g_cost + self.__calc_cost(p0=parent.pos, p1=pos)
+        self.h_cost = self.__calc_cost(p0=pos, p1=goal)
+        self.f_cost = self.g_cost + self.h_cost
+
+        self.visited = visited
+        
+    
+    def __calc_cost(self, p0: Point, p1: Point) -> float:
+        return np.sqrt(np.power(p1.x - p0.x, 2) + np.power(p1.y - p0.y, 2))
+    
+    def __str__(self) -> str:
+        return f"({self.x}, {self.y}): {self.g_cost:.4f} + {self.h_cost:.4f} = {self.f_cost:.4f}"
+ 
 
 class PathPlanner(Node):
 
@@ -65,7 +93,9 @@ class PathPlanner(Node):
         
         # -- node settings --
         self.cell_size = 0.2
-        self.orientation_method = 'last_3rd' # 'last_3rd', 'const_change', 'goal', 'start'
+        self.orientation_method = 'last_3rd'    # 'last_3rd', 'const_change', 'goal', 'start'
+        self.method_algorithm = 'Niko*'         # 'Niko*', 'A*'
+        self.step = 0.1
 
         # -- class variables --
         self.last_viewpoints: Viewpoints = None
@@ -79,6 +109,7 @@ class PathPlanner(Node):
         
         self.last_grid: OccupancyGrid = None
         self.occupancy_matrix: np.ndarray = None
+        self.corners: list[Point] = None
         self.occupied_value = 50
 
         self._reset_internals()
@@ -332,11 +363,20 @@ class PathPlanner(Node):
                     costs[i,j] = 0.0
                     paths[i,j] = None
                     continue
-                paths[i,j], costs[i,j] = self.method_a_star(
-                    start_pose=viewpoint_msg.viewpoints[i].pose,
-                    goal_pose=viewpoint_msg.viewpoints[j].pose,
-                    obstacles=np.copy(self.occupancy_matrix)
-                )
+                if self.method_algorithm == 'Niko*':
+                    if self.corners is None:
+                        self.corners = self._get_corners(np.copy(self.occupancy_matrix))
+                    paths[i,j], costs[i,j] = self.method_niko_star(
+                        start_pose=viewpoint_msg.viewpoints[i].pose,
+                        goal_pose=viewpoint_msg.viewpoints[j].pose,
+                        obstacles=np.copy(self.occupancy_matrix)
+                    )
+                else:
+                    paths[i,j], costs[i,j] = self.method_a_star(
+                        start_pose=viewpoint_msg.viewpoints[i].pose,
+                        goal_pose=viewpoint_msg.viewpoints[j].pose,
+                        obstacles=np.copy(self.occupancy_matrix)
+                    )
 
         # -- Calculate ideal order of points --
         points, total_cost = traveling_salesman(
@@ -471,6 +511,140 @@ class PathPlanner(Node):
         return (path, cost)
 
 
+    def method_niko_star(self, start_pose: Pose, goal_pose: Pose, obstacles: np.ndarray, ignore_obstacles: bool = False) -> tuple[Path, float]:
+    
+        def insert_in_stack(stack: list[NikoStarCell], new: NikoStarCell) -> list[NikoStarCell]:
+            if not stack: return [new]
+            i = 0
+            for item in stack:
+                if new.f_cost > item.f_cost: 
+                    i+=1
+                    continue
+                elif new.f_cost == item.f_cost and new.h_cost > item.h_cost:
+                    i+=1
+                    continue
+                else:
+                    break
+        
+            stack.insert(i, new)
+            return stack
+            
+        def find_and_del(stack: list[NikoStarCell], to_del: NikoStarCell) -> list[NikoStarCell]:
+            for i, item in enumerate(stack):
+                if item.x == to_del.x and item.y == to_del.y:
+                    del stack[i]
+                    return stack
+            print("A* Alg.: Could not find item to delete!")
+        
+        self.get_logger().info("-- Niko* is calculating a path --")
+
+        start = self._world_point_to_matrix(start_pose.position, self.cell_size)
+        goal = self._world_point_to_matrix(goal_pose.position, self.cell_size)
+        #start = start_pose
+        #goal = goal_pose
+
+        map = np.empty(obstacles.shape, dtype=NikoStarCell)
+        map[start.x, start.y] = NikoStarCell(pos=start, start=start, goal=goal, visited=True, parent=None)
+        stack: list[NikoStarCell] = []
+        cells = self.corners
+        cells.insert(0, goal)
+        p: NikoStarCell = map[start.x, start.y]
+        while p.x != goal.x or p.y != goal.y:
+            for cell in cells:
+                if cell.x == p.x and cell.y == p.y: 
+                    continue
+
+                if self._obstacle_on_path(p0=p, p1=cell, obstacles=np.copy(obstacles)) is None:
+                    continue
+
+                if map[cell.x, cell.y] is None:
+                    map[cell.x, cell.y] = NikoStarCell(
+                        pos=Point(x=cell.x, y=cell.y, z=Z_PLAIN),
+                        start=start,
+                        goal=goal,
+                        visited=False,
+                        parent=p
+                    )
+                    stack = insert_in_stack(stack=stack, new=map[cell.x, cell.y])
+                    continue
+
+                if map[cell.x, cell.y].visited:
+                    continue
+
+                new_pos = NikoStarCell(
+                    pos=Point(x=cell.x, y=cell.y, z=Z_PLAIN),
+                    start=start,
+                    goal=goal,
+                    visited=False,
+                    parent=p
+                )
+                if new_pos.f_cost < map[cell.x, cell.y].f_cost:
+                    map[cell.x, cell.y] = new_pos
+                    stack = find_and_del(stack=stack, to_del=new_pos)
+                    stack = insert_in_stack(stack=stack, new=new_pos)
+                    continue
+            
+            # -- Get next cell --            
+            try:
+                p = stack.pop(0)
+            except IndexError:
+                print("Niko* failed")
+                return ([], 0.0)
+            map[p.x, p.y].visited = True
+        
+        matrix_corner_points = [goal]
+        while p.x != start.x or p.y != start.y:
+            matrix_corner_points.append(p.parent.pos)
+            p = p.parent
+
+        # -- Convert Points back into world coordinates and reverse (leads to normal direction) --
+        corner_points: list[Point] = []
+        for point in matrix_corner_points[::-1]:
+            corner_points.append(self._matrix_point_to_world(point, self.cell_size))
+
+        # -- Fill with points between --
+        points: list[Point] = []
+        # TODO what if only two corner points
+        for p0, p1 in zip(corner_points[:-1], corner_points[1:]):
+            dp = Point(x=(p1.x-p0.x), y=(p1.y-p0.y), z=(p1.z-p0.z))
+            abs_dp = np.sqrt(np.power(dp.x, 2) + np.power(dp.y, 2) + np.power(dp.z, 2)) # Absolute from dp
+            dp_normal = Point(x=(dp.x/abs_dp), y=(dp.y/abs_dp), z=(dp.z/abs_dp))
+            n = round(abs_dp/self.step)
+            self.get_logger().info(f"{p0.x}, {p0.y} -> {p1.x}, {p1.y}: {n} steps")
+            step_lenght = abs_dp/float(n)
+            dp_step = Point(x=dp_normal.x*step_lenght, y=dp_normal.y*step_lenght, z=dp_normal.z*step_lenght)
+            points.append(p0)
+            for i in range(n-1):
+                points.append(Point(x=p0.x+(i*dp_step.x), y=p0.y+(i*dp_step.y), z=p0.z+(i*dp_step.z)))
+        points.append(goal_pose.position)
+        
+        # -- Get orientation --
+        orientations = self.compute_orientation(
+            start=start_pose.orientation,
+            goal=goal_pose.orientation,
+            len_points=len(points),
+        )
+
+        header = Header(
+            stamp=self.get_clock().now().to_msg(),
+            frame_id='n_map'
+        )
+        path = Path(
+            header=header,
+            poses=[PoseStamped(
+                header=header,
+                pose=Pose(
+                    position=point,
+                    orientation=orientation
+                )
+            ) for point, orientation in zip(points, orientations) ]
+        )
+        
+        cost = map[goal.x, goal.y].f_cost * 0.05
+        self.get_logger().info(f"-- Niko* finished: {len(path.poses)} tiles ({cost:.4f}m)")
+        return (path, cost)
+
+
     def compute_orientation(self, start: Quaternion, goal: Quaternion, len_points: int) -> list[Quaternion]:
         orientations: list[Quaternion] = []
         if self.orientation_method == 'const_change' and len_points > 1:
@@ -487,7 +661,7 @@ class PathPlanner(Node):
                 elif dir == 'anticlockwise':
                     qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, yaw0 - (n*yaw_per_step))
                 orientations.append(Quaternion(x=qx, y=qy, z=qz, w=qw))
-        elif self.orientation_method == 'last_3rd':
+        elif self.orientation_method == 'last_3rd' and len_points > 2:
             _, _, yaw0 = euler_from_quaternion([start.x, start.y, start.z, start.w])
             _, _, yaw1 = euler_from_quaternion([goal.x, goal.y, goal.z, goal.w])
 
@@ -515,7 +689,6 @@ class PathPlanner(Node):
             # -- Robot wil turn at the start and keep constant goal orientation --
             for n in range(len_points):
                 orientations.append(goal)
-                self.get_logger().info(f"Orientation = {goal.z}")
         
         # -- make sure the last orientation is the goal orientation --
         orientations[-1] = goal
@@ -524,6 +697,95 @@ class PathPlanner(Node):
     # ---------------------------
     # ---------- Other ----------
     # ---------------------------
+    def _get_corners(self, obstacles: np.ndarray) -> list[Point]:
+        # -- Get all cells that are around a obstacle
+        around_obstacles: np.ndarray = np.zeros((obstacles.shape))
+        for x in range(around_obstacles.shape[0]):
+            for y in reversed(range(around_obstacles.shape[1])):
+                try:
+                    obstacles[x+1, y+1]
+                    obstacles[x-1, y-1]
+                except IndexError:
+                    continue
+
+                visited_free = False
+                visited_occpied = False
+                for x_neighb in range(x-1, x + 2):
+                    for y_neighb in range(y-1, y+2):
+                        if x_neighb == x and y_neighb == y: continue
+
+                        if obstacles[x_neighb, y_neighb] > self.occupied_value: visited_occpied = True
+                        if obstacles[x_neighb, y_neighb] <= self.occupied_value: visited_free = True
+
+                        if visited_free and visited_occpied:
+                            if obstacles[x, y] <= self.occupied_value:
+                                around_obstacles[x, y] = -1.0
+                            break
+                    else:
+                        continue
+                    break
+        
+        # -- Only keep corner cells --
+        corners = np.zeros(obstacles.shape)
+        cells: list[Point] = []
+        for x in range(around_obstacles.shape[0]):
+            for y in reversed(range(around_obstacles.shape[1])):
+                try:
+                    obstacles[x+1, y+1]
+                    obstacles[x-1, y-1]
+                except IndexError:
+                    continue
+                
+                if not(around_obstacles[x-1, y] == -1.0 and around_obstacles[x, y] == -1.0 and around_obstacles[x+1, y] == -1.0) and not(around_obstacles[x, y-1] == -1.0 and around_obstacles[x, y] == -1.0 and around_obstacles[x, y+1] == -1.0):
+                    if around_obstacles[x, y] == -1.0:
+                        cells.append(Point(x=x, y=y))
+                        corners[x, y] = -1.0
+        
+        for cell in cells:
+            self.get_logger().info(f"({cell.x}, {cell.y})")
+        return cells
+
+    def _obstacle_on_path(self, p0: Point, p1: Point, obstacles: np.ndarray) -> list[Point]:
+        """ Bresenham line Algorithm: calculates the cells, over which a path would 'walk'
+
+        Args:
+            p0 (Point): start
+            p1 (Point): goal
+            obstacles (np.ndarray): _description_
+
+        Returns:
+            list[Point]: path or None if path leads over obstacle
+        """
+        dx = abs(p1.x - p0.x)
+        sx = 1 if p0.x < p1.x else -1
+        dy = -abs(p1.y - p0.y)
+        sy = 1 if p0.y < p1.y else -1
+        error = dx + dy
+
+        x = p0.x
+        y = p0.y
+        points: list[Point] = []
+        while True:
+            if obstacles[int(x), int(y)] > self.occupied_value:
+                return None
+            else:
+                points.append(Point(x=int(x), y=int(y)))
+            
+            if x == p1.x and y == p1.y:
+                break
+            doubled_error = 2 * error
+            if doubled_error >= dy:
+                if x == p1.x:
+                    break
+                error += dy
+                x += sx
+            if doubled_error <= dx:
+                if y == p1.y:
+                    break
+                error += dx
+                y += +sy
+        return points
+
     def _find_shortest_angle_and_dir(self, phi0: float, phi1: float) -> tuple[float, str]:
         diff = (phi1 - phi0 + np.pi) % (2*np.pi) - np.pi
         if diff < 0:
@@ -535,6 +797,7 @@ class PathPlanner(Node):
         self.grid_changed = True
         self.viewpoints_changed = True
         self.calculate_paths = True
+        self.corners = None
 
     def _grid_changed(self, grid: OccupancyGrid) -> bool:
         # -- If None type OccupancyGrid hasnt been initialized yet --

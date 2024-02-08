@@ -6,3 +6,4 @@
 
 .clang-format
 .pre-commit-config.yaml
+test.py

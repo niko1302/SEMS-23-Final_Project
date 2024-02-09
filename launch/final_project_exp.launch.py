@@ -21,6 +21,7 @@ def generate_launch_description() -> LaunchDescription:
     mapping_params_file_path = str(package_path / 'config/mapping_params.yaml')
     position_control_params_file_path = str(package_path / 'config/position_control_params.yaml')
     yaw_control_params_file_path = str(package_path / 'config/yaw_control_params.yaml')
+    path_planner_params_file_path =str(package_path / "config/path_planner_params.yaml")
 
     scenario_arg = DeclareLaunchArgument(
         name='scenario',
@@ -44,6 +45,9 @@ def generate_launch_description() -> LaunchDescription:
             executable='path_planner.py',
             package='final_project',
             parameters=[
+                LaunchConfiguration(
+                    'path_planner_params',
+                    default=path_planner_params_file_path),
                 {'use_sim_time': LaunchConfiguration('use_sim_time'),},
             ],
         ),

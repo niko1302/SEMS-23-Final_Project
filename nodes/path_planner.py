@@ -13,6 +13,7 @@ from scenario_msgs.msg import Viewpoints, Viewpoint
 from scenario_msgs.srv import MoveToStart, SetPath
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger, SetBool
+from rcl_interfaces.msg import SetParametersResult
 
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
@@ -94,9 +95,9 @@ class PathPlanner(Node):
         
         # -- node settings --
         self.cell_size = 0.2
-        self.orientation_method = 'last_3rd'    # 'last_3rd', 'const_change', 'goal', 'start'
-        self.method_algorithm = 'Niko*'         # 'Niko*', 'A*'
-        self.step = 0.1
+        self.orientation_method: str    # 'last_3rd', 'const_change', 'goal', 'start'
+        self.algorithm: str         # 'Niko*', 'A*'
+        self.step: float
 
         # -- class variables --
         self.last_viewpoints: Viewpoints = None
@@ -114,6 +115,10 @@ class PathPlanner(Node):
         self.occupied_value = 50
 
         self._reset_internals()
+
+        # -- Parameters --
+        self.init_params()
+        self.add_on_set_parameters_callback(self.on_params_changed)
 
         # -- call other initialisation functions --
         self.init_clients()
@@ -177,6 +182,44 @@ class PathPlanner(Node):
             callback_group=cb_group
         )
 
+
+    def init_params(self) -> None:
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('orientation_method', rclpy.Parameter.Type.STRING),
+                ('algorithm', rclpy.Parameter.Type.STRING),
+                ('step', rclpy.Parameter.Type.DOUBLE),
+            ]
+        )
+
+        param = self.get_parameter('orientation_method')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.orientation_method = param.value
+
+        param = self.get_parameter('algorithm')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.algorithm = param.value
+
+        param = self.get_parameter('step')
+        self.get_logger().info(f'{param.name}={param.value}')
+        self.step = param.value
+
+
+    def on_params_changed(self, params) -> SetParametersResult:
+        param: rclpy.Parameter
+        for param in params:
+            self.get_logger().info(f'Try to set [{param.name}] = {param.value}')
+            if param.name == 'orientation_method':
+                self.orientation_method = param.value
+            elif param.name == 'algorithm':
+                self.algorithm = param.value
+            elif param.name == 'step':
+                self.step = param.value
+            else:
+                self.get_logger().warning('Did not find parameter!')
+        return SetParametersResult(successful= True, reason='Parameter set!')
+    
     # -------------------------------------
     # ---------- on service call ----------
     # -------------------------------------
@@ -351,7 +394,7 @@ class PathPlanner(Node):
                     costs[i,j] = 0.0
                     paths[i,j] = None
                     continue
-                if self.method_algorithm == 'Niko*':
+                if self.algorithm == 'Niko*':
                     if self.corners is None:
                         self.corners = self._get_corners(np.copy(self.occupancy_matrix))
                     paths[i,j], costs[i,j] = self.method_niko_star(

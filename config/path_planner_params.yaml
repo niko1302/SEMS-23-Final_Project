@@ -1,0 +1,5 @@
+/**: # wildcard for the node name
+  ros__parameters:
+    orientation_method: 'last_3rd'  # 'last_3rd', 'const_change', 'goal', 'start'
+    algorithm: 'A*'              # 'Niko*', 'A*'
+    step: 0.1                       # [m] discrete steps every ...

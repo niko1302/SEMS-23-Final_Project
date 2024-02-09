@@ -18,6 +18,7 @@ from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
 
 Z_PLAIN = -0.5
+LOGGER = False
 
 class State(Enum):
     UNSET = auto()
@@ -184,31 +185,31 @@ class PathPlanner(Node):
         self.get_logger().info(f"Start Position at: {request.target_pose.position.x}, {request.target_pose.position.y}")
         self.state = State.MOVE_TO_START
         self.start_pose = request.target_pose
-        
-        
-        # -- Reduce position controller speed 
-        if self.reduce_pos_K_client.call(SetBool.Request(data=True)).success:
-            self.get_logger().info("-> Reduced pos speed mode. <-")
-        else:
-            self.get_logger().info("-> Failed to set pos speed mode. <-")
-        
-        # -- Reduce yaw controller speed 
-        if self.reduce_yaw_K_client.call(SetBool.Request(data=True)).success:
-            self.get_logger().info("-> Reduced yaw speed mode. <-")
-        else:
-            self.get_logger().info("-> Failed to set yaw speed mode. <-")
+
+        points = self._smooth_line(
+            p0=request.current_pose.position,
+            p1=request.target_pose.position
+        )
+        orientations = self.compute_orientation(
+            start=request.current_pose.orientation,
+            goal=request.target_pose.orientation,
+            len_points=len(points)
+        )
 
         # -- just use the goal point as the last and only entry in our path --
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         path = Path()
         path.header = header
-        path.poses.append(
+        path.poses = [
             PoseStamped(
                 header=header,
-                pose=request.target_pose
+                pose=Pose(
+                    position=point,
+                    orientation=orientation
+                )
             )
-        )
+        for point, orientation in zip(points, orientations)]
         
         path_response: SetPath.Response = self.set_path_client.call(
             SetPath.Request(path=path))
@@ -224,19 +225,6 @@ class PathPlanner(Node):
 
     def srv_start(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.get_logger().info("---- NORMAL OPERATION ----")
-        
-        
-        # -- Return position controller speed to normal
-        if self.reduce_pos_K_client.call(SetBool.Request(data=False)).success:
-            self.get_logger().info("-> Normal speed mode. <-")
-        else:
-            self.get_logger().info("-> Failed to set speed mode. <-")
-        
-        # -- Return yaw controller speed to normal
-        if self.reduce_yaw_K_client.call(SetBool.Request(data=False)).success:
-            self.get_logger().info("-> Normal speed mode. <-")
-        else:
-            self.get_logger().info("-> Failed to set speed mode. <-")
         
         if self.state != State.NORMAL_OPERATION:
             self.get_logger().info('Starting normal operation.')
@@ -540,8 +528,6 @@ class PathPlanner(Node):
 
         start = self._world_point_to_matrix(start_pose.position, self.cell_size)
         goal = self._world_point_to_matrix(goal_pose.position, self.cell_size)
-        #start = start_pose
-        #goal = goal_pose
 
         map = np.empty(obstacles.shape, dtype=NikoStarCell)
         map[start.x, start.y] = NikoStarCell(pos=start, start=start, goal=goal, visited=True, parent=None)
@@ -604,19 +590,8 @@ class PathPlanner(Node):
 
         # -- Fill with points between --
         points: list[Point] = []
-        # TODO what if only two corner points
         for p0, p1 in zip(corner_points[:-1], corner_points[1:]):
-            dp = Point(x=(p1.x-p0.x), y=(p1.y-p0.y), z=(p1.z-p0.z))
-            abs_dp = np.sqrt(np.power(dp.x, 2) + np.power(dp.y, 2) + np.power(dp.z, 2)) # Absolute from dp
-            dp_normal = Point(x=(dp.x/abs_dp), y=(dp.y/abs_dp), z=(dp.z/abs_dp))
-            n = round(abs_dp/self.step)
-            self.get_logger().info(f"{p0.x}, {p0.y} -> {p1.x}, {p1.y}: {n} steps")
-            step_lenght = abs_dp/float(n)
-            dp_step = Point(x=dp_normal.x*step_lenght, y=dp_normal.y*step_lenght, z=dp_normal.z*step_lenght)
-            points.append(p0)
-            for i in range(n-1):
-                points.append(Point(x=p0.x+(i*dp_step.x), y=p0.y+(i*dp_step.y), z=p0.z+(i*dp_step.z)))
-        points.append(goal_pose.position)
+            points += self._smooth_line(p0, p1)
         
         # -- Get orientation --
         orientations = self.compute_orientation(
@@ -697,6 +672,29 @@ class PathPlanner(Node):
     # ---------------------------
     # ---------- Other ----------
     # ---------------------------
+    def _smooth_line(self, p0: Point, p1: Point) -> list[Point]:
+        points: list[Point] = []
+        
+        # -- Get normalized vector --
+        dp = Point(x=(p1.x-p0.x), y=(p1.y-p0.y), z=(p1.z-p0.z))
+        abs_dp : float= np.sqrt(np.power(dp.x, 2) + np.power(dp.y, 2) + np.power(dp.z, 2))
+        if abs_dp <= self.step: return [p1]
+        dp_normal = Point(x=(dp.x/abs_dp), y=(dp.y/abs_dp), z=(dp.z/abs_dp))
+
+        # -- Calculate steps and step lenght --
+        n = round(abs_dp/self.step)
+        step_lenght = abs_dp/float(n)
+        dp_step = Point(x=dp_normal.x*step_lenght, y=dp_normal.y*step_lenght, z=dp_normal.z*step_lenght)
+
+        if LOGGER:
+            self.get_logger().info(f"{p0.x}, {p0.y} -> {p1.x}, {p1.y}: {n} steps")
+
+        # -- Fill path (ignore stating point)--
+        for i in range(1, n-1):
+                points.append(Point(x=p0.x+(i*dp_step.x), y=p0.y+(i*dp_step.y), z=p0.z+(i*dp_step.z)))
+        points.append(p1)
+        return points
+
     def _get_corners(self, obstacles: np.ndarray) -> list[Point]:
         # -- Get all cells that are around a obstacle
         around_obstacles: np.ndarray = np.zeros((obstacles.shape))
@@ -741,8 +739,9 @@ class PathPlanner(Node):
                         cells.append(Point(x=x, y=y))
                         corners[x, y] = -1.0
         
-        for cell in cells:
-            self.get_logger().info(f"({cell.x}, {cell.y})")
+        if LOGGER:
+            for cell in cells:
+                self.get_logger().info(f"({cell.x}, {cell.y})")
         return cells
 
     def _obstacle_on_path(self, p0: Point, p1: Point, obstacles: np.ndarray) -> list[Point]:
